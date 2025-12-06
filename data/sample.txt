@@ -1,0 +1,5 @@
+Retrieval-augmented generation (RAG) combines information retrieval with generative language models.
+It retrieves context from a knowledge base and feeds it to a generator, improving factuality and grounding.
+Key components include chunking source documents, embedding them into vectors, storing them in a vector database, and retrieving the top relevant chunks for a query.
+Choosing chunk sizes that match model context and adding metadata like source and section helps with traceability and filtering.
+RAG systems often cite sources, apply safety filters, and refresh their indexes as content changes.
