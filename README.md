@@ -29,6 +29,7 @@ Helper script that starts `ollama serve` (if needed) and runs the Ollama query:
 ./run_ollama_and_query.sh "What is retrieval-augmented generation?"
 ```
 The CLI reads files, chunks, embeds, saves to `artifacts/langchain_index/`, retrieves, and answers with citations.
+Model downloads (embeddings/rerankers) default to `artifacts/`; override with `--cache-folder` or `CACHE_FOLDER`.
 
 ## Evaluate with a Hugging Face dataset (LangChain)
 - Quick retrieval check (uses `RecursiveCharacterTextSplitter`, LangChain FAISS, and your chosen embedding model):
@@ -36,6 +37,11 @@ The CLI reads files, chunks, embeds, saves to `artifacts/langchain_index/`, retr
 python langchain_dataset_metrics.py --dataset squad --split "train[:2000]" --sample-size 800 --embedding-model all-MiniLM-L6-v2 --metrics-json artifacts/lc_metrics.json --metrics-plot artifacts/lc_metrics.png
 ```
 - Flags are the usual suspects: tweak `--chunk-size`, `--chunk-overlap`, `--top-k`, and `--embedding-model`. Prints metrics; optionally writes JSON/PNG.
+- Compare baseline vs reranker (runs both in one go and writes comparison JSON for the Dash UI):
+```
+./run_reranker_comparison.sh
+```
+Outputs land in `artifacts/` (`lc_metrics*.json/.png` plus `lc_metrics_reranker.json` and `lc_metrics_comparison.json`).
 
 ## Evaluation results
 - Current sample run (`squad` split `train[:2000]`, 800 examples, `all-MiniLM-L6-v2` embeddings):
@@ -50,7 +56,8 @@ python langchain_dataset_metrics.py --dataset squad --split "train[:2000]" --sam
 ```
 python app.py
 ```
-- Pick a sample question or type your own. Context shows with scores; answers include citations. Metrics come from `artifacts/lc_metrics.json` if present.
+- Pick a sample question or type your own. Context shows with scores; answers include citations. Metrics come from `artifacts/lc_metrics.json` (baseline) and `artifacts/lc_metrics_reranker.json` (if present) to render the baseline vs reranker chart.
+- Override metric paths with `METRICS_PATH` (baseline) and `RERANKER_METRICS_PATH` (reranker) if you store results elsewhere.
 - Defaults: provider=`ollama`, model=`gemma3:1b` (auto-pulled if missing), embedding model=`all-MiniLM-L6-v2`. Override with `WEB_APP_PROVIDER`, `WEB_APP_MODEL`, `WEB_APP_EMBED_MODEL`, `WEB_APP_TOP_K`, or `OLLAMA_BASE_URL`.
 
 ## Useful flags
@@ -59,6 +66,7 @@ python langchain_rag.py ingest --help
 python langchain_rag.py query --help
 ```
 Key flags: `--chunk-size`, `--chunk-overlap`, `--embedding-model`, `--top-k`, `--index-path`, `--data-dir`, `--provider`, `--ollama-base-url`.
+Model caching: `--cache-folder` (or `CACHE_FOLDER`) controls where embeddings/reranker weights land (default `artifacts/`).
 
 ## Project layout
 - `langchain_rag.py` — ingestion, indexing, retrieval, and query CLI (LangChain-based).

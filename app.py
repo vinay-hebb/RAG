@@ -18,7 +18,7 @@ import plotly.graph_objects as go
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 
-from langchain_rag import build_chain, build_embeddings, build_llm
+from langchain_rag import build_chain, build_embeddings, build_llm, build_reranker, retrieve_and_rerank
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rag_app")
@@ -26,6 +26,8 @@ logger = logging.getLogger("rag_app")
 INDEX_PATH = Path(os.getenv("INDEX_PATH", "artifacts/langchain_index"))
 EMBEDDING_MODEL = os.getenv("WEB_APP_EMBED_MODEL", "all-MiniLM-L6-v2")
 METRICS_PATH = Path(os.getenv("METRICS_PATH", "artifacts/lc_metrics.json"))
+CACHE_FOLDER = Path(os.getenv("CACHE_FOLDER", "artifacts"))
+RERANKER_METRICS_PATH = Path(os.getenv("RERANKER_METRICS_PATH", "artifacts/lc_metrics_reranker.json"))
 DEFAULT_TOP_K = int(os.getenv("WEB_APP_TOP_K", "4"))
 DEFAULT_MODEL = os.getenv("WEB_APP_MODEL", os.getenv("OPENAI_MODEL", "gemma3:1b"))
 DEFAULT_PROVIDER = os.getenv("WEB_APP_PROVIDER", "ollama")
@@ -33,6 +35,10 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/")
 DEFAULT_SAMPLE_DATASET = os.getenv("SAMPLE_QUESTION_DATASET", "squad")
 DEFAULT_SAMPLE_SPLIT = os.getenv("SAMPLE_QUESTION_SPLIT", "train[:200]")
 SAMPLE_QUESTION_LIMIT = int(os.getenv("SAMPLE_QUESTION_LIMIT", "4"))
+SAMPLE_QUESTION_DATA_DIR = os.getenv("SAMPLE_QUESTION_DATA_DIR")
+USE_RERANKER = os.getenv("USE_RERANKER", "false").lower() in {"1", "true", "yes", "on"}
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+RERANK_CANDIDATES = max(int(os.getenv("RERANK_CANDIDATES", "20")), DEFAULT_TOP_K)
 
 FALLBACK_SAMPLE_QUESTIONS: List[str] = [
     "What is retrieval-augmented generation?",
@@ -42,12 +48,16 @@ FALLBACK_SAMPLE_QUESTIONS: List[str] = [
 ]
 
 store: Optional[FAISS] = None
+reranker: Optional[object] = None
 
 
 def load_sample_questions() -> List[str]:
     """Pull a handful of questions from HF; fall back to static ones on any hiccup."""
     try:
-        dataset = load_dataset(DEFAULT_SAMPLE_DATASET, split=DEFAULT_SAMPLE_SPLIT)
+        dataset_kwargs = {"split": DEFAULT_SAMPLE_SPLIT}
+        if SAMPLE_QUESTION_DATA_DIR:
+            dataset_kwargs["data_dir"] = SAMPLE_QUESTION_DATA_DIR
+        dataset = load_dataset(DEFAULT_SAMPLE_DATASET, **dataset_kwargs)
     except Exception as exc:
         logger.warning("Could not fetch sample questions (%s); using built-ins.", exc)
         return FALLBACK_SAMPLE_QUESTIONS
@@ -71,7 +81,7 @@ DEFAULT_QUESTION = SAMPLE_QUESTIONS[0] if SAMPLE_QUESTIONS else FALLBACK_SAMPLE_
 def load_store(path: Path, embedding_model: str) -> Tuple[Optional[FAISS], Optional[object]]:
     if not path.exists():
         return None, None
-    embeddings = build_embeddings(embedding_model)
+    embeddings = build_embeddings(embedding_model, cache_folder=CACHE_FOLDER)
     loaded_store = FAISS.load_local(str(path), embeddings, allow_dangerous_deserialization=True)
     return loaded_store, embeddings
 
@@ -147,8 +157,101 @@ def build_hit_rate_figure(metrics: Optional[Dict[str, float]]) -> go.Figure:
     return fig
 
 
+def build_comparison_hit_rate_figure(
+    baseline: Optional[Dict[str, float]],
+    reranker_metrics: Optional[Dict[str, float]],
+) -> go.Figure:
+    if not baseline or not reranker_metrics:
+        fig = build_hit_rate_figure(baseline)
+        fig.update_layout(title="Run run_reranker_comparison.sh to compare reranker.")
+        return fig
+
+    baseline_hits = dict(extract_hit_rates(baseline))
+    reranker_hits = dict(extract_hit_rates(reranker_metrics))
+    ks = sorted(set(baseline_hits) | set(reranker_hits))
+    labels = [f"@{k}" for k in ks]
+    baseline_values = [baseline_hits.get(k, 0.0) for k in ks]
+    reranker_values = [reranker_hits.get(k, 0.0) for k in ks]
+    deltas = [r - b for b, r in zip(baseline_values, reranker_values)]
+
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                name="Baseline",
+                x=labels,
+                y=baseline_values,
+                marker_color="#38bdf8",
+                text=[f"{v:.2f}" for v in baseline_values],
+                textposition="outside",
+            ),
+            go.Bar(
+                name="Reranker",
+                x=labels,
+                y=reranker_values,
+                marker_color="#22c55e",
+                text=[f"{v:.2f} ({d:+.2f})" for v, d in zip(reranker_values, deltas)],
+                textposition="outside",
+            ),
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        height=360,
+        barmode="group",
+        margin=dict(t=60, l=80, r=40, b=60),
+        paper_bgcolor="#0b1222",
+        plot_bgcolor="#0b1222",
+        font=dict(color="#e2e8f0"),
+        title="Hit-rate@k: baseline vs reranker",
+        xaxis_title="k (top-k)",
+        yaxis_title="Hit rate",
+        legend=dict(orientation="h", y=-0.2),
+    )
+    fig.update_yaxes(range=[0, 1.05], dtick=0.25, gridcolor="#1f2937", zeroline=False)
+    fig.update_xaxes(showgrid=False)
+    return fig
+
+
+def metric_value(metrics: Optional[Dict[str, float]], key: str, formatter) -> str:
+    if not metrics:
+        return "—"
+    try:
+        value = metrics.get(key)
+    except AttributeError:
+        return "—"
+    if value is None:
+        return "—"
+    try:
+        return formatter(value)
+    except Exception:
+        return "—"
+
+
+def metric_delta(
+    baseline: Optional[Dict[str, float]],
+    reranker_metrics: Optional[Dict[str, float]],
+    key: str,
+    lower_is_better: bool = False,
+) -> Tuple[str, str]:
+    if not baseline or not reranker_metrics:
+        return "—", "#9ca3af"
+    base_val = baseline.get(key)
+    rerank_val = reranker_metrics.get(key)
+    if base_val is None or rerank_val is None:
+        return "—", "#9ca3af"
+    try:
+        delta = float(rerank_val) - float(base_val)
+    except (TypeError, ValueError):
+        return "—", "#9ca3af"
+    good = delta < 0 if lower_is_better else delta > 0
+    color = "#22c55e" if good else "#f87171"
+    fmt = f"{delta:+.3f}" if abs(delta) < 10 else f"{delta:+.1f}"
+    return fmt, color
+
+
 def retrieve_with_scores(active_store: FAISS, question: str, k: int) -> List[Tuple[Document, float]]:
-    return active_store.similarity_search_with_score(question, k=k)
+    candidate_k = RERANK_CANDIDATES if reranker else k
+    return retrieve_and_rerank(active_store, question, top_k=k, reranker=reranker, candidate_k=candidate_k)
 
 
 def is_ollama_running() -> bool:
@@ -206,14 +309,53 @@ def answer_question(question: str) -> Tuple[str, List[Tuple[Document, float]]]:
         temperature=float(os.getenv("WEB_APP_TEMPERATURE", "0.2")),
         ollama_base_url=OLLAMA_BASE_URL,
     )
-    chain = build_chain(store, llm, top_k=DEFAULT_TOP_K)
+    chain = build_chain(
+        store,
+        llm,
+        top_k=DEFAULT_TOP_K,
+        reranker=reranker,
+        candidate_k=RERANK_CANDIDATES if reranker else DEFAULT_TOP_K,
+    )
     answer = chain.invoke(question)
     return answer, docs_with_scores
 
 
 store, _embeddings = load_store(INDEX_PATH, EMBEDDING_MODEL)
 metrics_cache = load_metrics(METRICS_PATH)
-hit_rate_fig = build_hit_rate_figure(metrics_cache)
+reranker_metrics_cache = load_metrics(RERANKER_METRICS_PATH)
+hit_rate_fig = build_comparison_hit_rate_figure(metrics_cache, reranker_metrics_cache)
+if USE_RERANKER:
+    try:
+        reranker = build_reranker(RERANKER_MODEL, cache_folder=CACHE_FOLDER)
+        logger.info("Loaded reranker model '%s'", RERANKER_MODEL)
+    except Exception as exc:
+        logger.warning("Reranker '%s' failed to load (%s); continuing without it.", RERANKER_MODEL, exc)
+        reranker = None
+
+
+def metric_tile(
+    label: str,
+    key: str,
+    formatter,
+    lower_is_better: bool = False,
+) -> html.Div:
+    delta_text, delta_color = metric_delta(metrics_cache, reranker_metrics_cache, key, lower_is_better=lower_is_better)
+    return html.Div(
+        [
+            html.Div(label, style={"fontSize": "13px", "color": "#93c5fd", "marginBottom": "4px"}),
+            html.Div(
+                [
+                    html.Span(metric_value(metrics_cache, key, formatter), style={"marginRight": "8px"}),
+                    html.Span(
+                        metric_value(reranker_metrics_cache, key, formatter),
+                        style={"marginRight": "8px", "color": "#cbd5e1"},
+                    ),
+                    html.Span(delta_text, style={"color": delta_color, "fontSize": "14px", "fontWeight": 700}),
+                ],
+                style={"display": "flex", "alignItems": "baseline"},
+            ),
+        ]
+    )
 
 app = Dash(__name__, title="LangChain RAG Playground")
 server = app.server
@@ -316,7 +458,7 @@ app.layout = html.Div(
                     html.Div(id="retrieved-context"),
                 ]),
                 card([
-                    html.Div("Evaluation metrics on squad", style={"fontSize": "18px", "marginBottom": "8px"}),
+                    html.Div("Evaluation metrics (baseline vs reranker)", style={"fontSize": "18px", "marginBottom": "8px"}),
                     html.Div(
                         style={"display": "grid", "gridTemplateColumns": "2fr 1fr", "gap": "16px", "alignItems": "stretch"},
                         children=[
@@ -338,24 +480,9 @@ app.layout = html.Div(
                                     "alignContent": "start",
                                 },
                                 children=[
-                                    html.Div(
-                                        [
-                                            html.Div("MRR", style={"fontSize": "13px", "color": "#93c5fd", "marginBottom": "4px"}),
-                                            html.Div(f"{metrics_cache.get('mrr', 0.0):.3f}" if metrics_cache else "—", style={"fontSize": "20px", "fontWeight": 700}),
-                                        ]
-                                    ),
-                                    html.Div(
-                                        [
-                                            html.Div("Mean Rank", style={"fontSize": "13px", "color": "#93c5fd", "marginBottom": "4px"}),
-                                            html.Div(f"{metrics_cache.get('mean_rank', 0.0):.2f}" if metrics_cache else "—", style={"fontSize": "20px", "fontWeight": 700}),
-                                        ]
-                                    ),
-                                    html.Div(
-                                        [
-                                            html.Div("Number of samples", style={"fontSize": "13px", "color": "#93c5fd", "marginBottom": "4px"}),
-                                            html.Div(f"{int(metrics_cache.get('total_queries', 0.0)):,}" if metrics_cache else "—", style={"fontSize": "20px", "fontWeight": 700}),
-                                        ]
-                                    ),
+                                    metric_tile("MRR (baseline | reranker | Δ)", "mrr", lambda v: f"{float(v):.3f}"),
+                                    metric_tile("Mean Rank (baseline | reranker | Δ)", "mean_rank", lambda v: f"{float(v):.2f}", lower_is_better=True),
+                                    metric_tile("Number of samples (baseline | reranker)", "total_queries", lambda v: f"{int(float(v)):,}"),
                                 ],
                             ),
                         ],

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence
@@ -20,7 +21,7 @@ from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from langchain_rag import build_embeddings
+from langchain_rag import DEFAULT_CACHE_FOLDER, build_embeddings, build_reranker, retrieve_and_rerank
 
 
 DEFAULT_TOP_K = (1, 3, 5, 10)
@@ -93,8 +94,8 @@ def load_corpus(
     return Corpus(chunks=chunks, examples=examples)
 
 
-def build_store(corpus: Corpus, embedding_model: str) -> FAISS:
-    embeddings = build_embeddings(embedding_model)
+def build_store(corpus: Corpus, embedding_model: str, cache_folder: Path) -> FAISS:
+    embeddings = build_embeddings(embedding_model, cache_folder=cache_folder)
     return FAISS.from_documents(corpus.chunks, embeddings)
 
 
@@ -108,14 +109,24 @@ def evaluate_retrieval(
     store: FAISS,
     corpus: Corpus,
     top_k_values: Sequence[int],
+    reranker=None,
+    candidate_k: int = 0,
 ) -> Dict[str, float]:
     max_k = max(top_k_values)
+    search_k = max(candidate_k, max_k)
     hits_by_k = {k: 0 for k in top_k_values}
+    ndcg_by_k = {k: 0.0 for k in top_k_values}
     reciprocal_ranks: List[float] = []
     ranks: List[int] = []
 
     for example in tqdm(corpus.examples, desc="Evaluating queries"):
-        results = store.similarity_search_with_score(example.question, k=max_k)
+        results = retrieve_and_rerank(
+            store,
+            example.question,
+            top_k=max_k,
+            reranker=reranker,
+            candidate_k=search_k,
+        )
         doc_hits = [doc.metadata.get("doc_id") for doc, _ in results]
         rank = None
         for i, doc_id in enumerate(doc_hits):
@@ -131,9 +142,11 @@ def evaluate_retrieval(
             for k in top_k_values:
                 if rank < k:
                     hits_by_k[k] += 1
+                    ndcg_by_k[k] += 1.0 / math.log2(float(rank + 2))
 
     total = len(corpus.examples)
     hit_rates = {f"hit_rate@{k}": hits_by_k[k] / float(total) for k in top_k_values}
+    ndcgs = {f"ndcg@{k}": ndcg_by_k[k] / float(total) for k in top_k_values}
 
     metrics: Dict[str, float] = {
         "total_queries": float(total),
@@ -141,6 +154,7 @@ def evaluate_retrieval(
         "mean_rank": float(np.mean(ranks)),
     }
     metrics.update(hit_rates)
+    metrics.update(ndcgs)
     return metrics
 
 
@@ -184,10 +198,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=str, default="1,3,5,10", help="Comma-separated list of k values")
     parser.add_argument("--embedding-model", type=str, default="all-MiniLM-L6-v2", help="Embedding model to use")
     parser.add_argument(
+        "--cache-folder",
+        type=str,
+        default=str(DEFAULT_CACHE_FOLDER),
+        help="Directory to store downloaded model weights and tokenizer files",
+    )
+    parser.add_argument(
         "--index-path",
         type=str,
         default="artifacts/langchain_index",
         help="Where to persist the FAISS index for the web app",
+    )
+    parser.add_argument(
+        "--use-reranker",
+        action="store_true",
+        help="Enable cross-encoder reranking when evaluating retrieval",
+    )
+    parser.add_argument(
+        "--reranker-model",
+        type=str,
+        default="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        help="Cross-encoder model for reranking",
+    )
+    parser.add_argument(
+        "--rerank-candidates",
+        type=int,
+        default=20,
+        help="How many candidates to retrieve from the vector store before reranking",
     )
     parser.add_argument("--metrics-json", type=str, default=None, help="Optional path to save metrics as JSON")
     parser.add_argument("--metrics-plot", type=str, default=None, help="Optional path to save hit-rate@k bar plot (PNG)")
@@ -197,6 +234,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     top_k_values = parse_top_k(args.top_k)
+    cache_folder = Path(args.cache_folder)
+    reranker = build_reranker(args.reranker_model, cache_folder=cache_folder) if args.use_reranker else None
     corpus = load_corpus(
         dataset_name=args.dataset,
         split=args.split,
@@ -205,8 +244,15 @@ def main() -> None:
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
     )
-    store = build_store(corpus, args.embedding_model)
-    metrics = evaluate_retrieval(store, corpus, top_k_values=top_k_values)
+    store = build_store(corpus, args.embedding_model, cache_folder=cache_folder)
+    candidate_k = max(args.rerank_candidates if args.use_reranker else max(top_k_values), max(top_k_values))
+    metrics = evaluate_retrieval(
+        store,
+        corpus,
+        top_k_values=top_k_values,
+        reranker=reranker,
+        candidate_k=candidate_k,
+    )
     print(json.dumps(metrics, indent=2))
     index_path = Path(args.index_path)
     save_index(store, index_path)
