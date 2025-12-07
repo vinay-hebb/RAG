@@ -28,6 +28,7 @@ EMBEDDING_MODEL = os.getenv("WEB_APP_EMBED_MODEL", "all-MiniLM-L6-v2")
 METRICS_PATH = Path(os.getenv("METRICS_PATH", "artifacts/lc_metrics.json"))
 CACHE_FOLDER = Path(os.getenv("CACHE_FOLDER", "artifacts"))
 RERANKER_METRICS_PATH = Path(os.getenv("RERANKER_METRICS_PATH", "artifacts/lc_metrics_reranker.json"))
+AGENTIC_METRICS_PATH = Path(os.getenv("AGENTIC_METRICS_PATH", "artifacts/lc_metrics_agentic.json"))
 DEFAULT_TOP_K = int(os.getenv("WEB_APP_TOP_K", "4"))
 DEFAULT_MODEL = os.getenv("WEB_APP_MODEL", os.getenv("OPENAI_MODEL", "gemma3:1b"))
 DEFAULT_PROVIDER = os.getenv("WEB_APP_PROVIDER", "ollama")
@@ -160,19 +161,23 @@ def build_hit_rate_figure(metrics: Optional[Dict[str, float]]) -> go.Figure:
 def build_comparison_hit_rate_figure(
     baseline: Optional[Dict[str, float]],
     reranker_metrics: Optional[Dict[str, float]],
+    agentic_metrics: Optional[Dict[str, float]],
 ) -> go.Figure:
     if not baseline or not reranker_metrics:
         fig = build_hit_rate_figure(baseline)
-        fig.update_layout(title="Run run_reranker_comparison.sh to compare reranker.")
+        fig.update_layout(title="Run run_rag_comparison.sh to compare retrieval variants.")
         return fig
 
     baseline_hits = dict(extract_hit_rates(baseline))
     reranker_hits = dict(extract_hit_rates(reranker_metrics))
-    ks = sorted(set(baseline_hits) | set(reranker_hits))
+    agentic_hits = dict(extract_hit_rates(agentic_metrics)) if agentic_metrics else {}
+    ks = sorted(set(baseline_hits) | set(reranker_hits) | set(agentic_hits))
     labels = [f"@{k}" for k in ks]
     baseline_values = [baseline_hits.get(k, 0.0) for k in ks]
     reranker_values = [reranker_hits.get(k, 0.0) for k in ks]
-    deltas = [r - b for b, r in zip(baseline_values, reranker_values)]
+    agentic_values = [agentic_hits.get(k, 0.0) for k in ks] if agentic_hits else None
+    rerank_deltas = [r - b for b, r in zip(baseline_values, reranker_values)]
+    agentic_deltas = [a - b for b, a in zip(baseline_values, agentic_values)] if agentic_values else None
 
     fig = go.Figure(
         data=[
@@ -189,11 +194,20 @@ def build_comparison_hit_rate_figure(
                 x=labels,
                 y=reranker_values,
                 marker_color="#22c55e",
-                text=[f"{v:.2f} ({d:+.2f})" for v, d in zip(reranker_values, deltas)],
+                text=[f"{v:.2f} ({d:+.2f})" for v, d in zip(reranker_values, rerank_deltas)],
                 textposition="outside",
             ),
         ]
     )
+    if agentic_values is not None:
+        fig.add_bar(
+            name="Agentic",
+            x=labels,
+            y=agentic_values,
+            marker_color="#f59e0b",
+            text=[f"{v:.2f} ({d:+.2f})" for v, d in zip(agentic_values, agentic_deltas)],
+            textposition="outside",
+        )
     fig.update_layout(
         template="plotly_dark",
         height=360,
@@ -202,7 +216,7 @@ def build_comparison_hit_rate_figure(
         paper_bgcolor="#0b1222",
         plot_bgcolor="#0b1222",
         font=dict(color="#e2e8f0"),
-        title="Hit-rate@k: baseline vs reranker",
+        title="Hit-rate@k: baseline vs reranker vs agentic",
         xaxis_title="k (top-k)",
         yaxis_title="Hit rate",
         legend=dict(orientation="h", y=-0.2),
@@ -229,18 +243,18 @@ def metric_value(metrics: Optional[Dict[str, float]], key: str, formatter) -> st
 
 def metric_delta(
     baseline: Optional[Dict[str, float]],
-    reranker_metrics: Optional[Dict[str, float]],
+    compare: Optional[Dict[str, float]],
     key: str,
     lower_is_better: bool = False,
 ) -> Tuple[str, str]:
-    if not baseline or not reranker_metrics:
+    if not baseline or not compare:
         return "—", "#9ca3af"
     base_val = baseline.get(key)
-    rerank_val = reranker_metrics.get(key)
-    if base_val is None or rerank_val is None:
+    other_val = compare.get(key)
+    if base_val is None or other_val is None:
         return "—", "#9ca3af"
     try:
-        delta = float(rerank_val) - float(base_val)
+        delta = float(other_val) - float(base_val)
     except (TypeError, ValueError):
         return "—", "#9ca3af"
     good = delta < 0 if lower_is_better else delta > 0
@@ -323,7 +337,8 @@ def answer_question(question: str) -> Tuple[str, List[Tuple[Document, float]]]:
 store, _embeddings = load_store(INDEX_PATH, EMBEDDING_MODEL)
 metrics_cache = load_metrics(METRICS_PATH)
 reranker_metrics_cache = load_metrics(RERANKER_METRICS_PATH)
-hit_rate_fig = build_comparison_hit_rate_figure(metrics_cache, reranker_metrics_cache)
+agentic_metrics_cache = load_metrics(AGENTIC_METRICS_PATH)
+hit_rate_fig = build_comparison_hit_rate_figure(metrics_cache, reranker_metrics_cache, agentic_metrics_cache)
 if USE_RERANKER:
     try:
         reranker = build_reranker(RERANKER_MODEL, cache_folder=CACHE_FOLDER)
@@ -339,18 +354,25 @@ def metric_tile(
     formatter,
     lower_is_better: bool = False,
 ) -> html.Div:
-    delta_text, delta_color = metric_delta(metrics_cache, reranker_metrics_cache, key, lower_is_better=lower_is_better)
+    rerank_delta, rerank_color = metric_delta(
+        metrics_cache, reranker_metrics_cache, key, lower_is_better=lower_is_better
+    )
+    agentic_delta, agentic_color = metric_delta(
+        metrics_cache, agentic_metrics_cache, key, lower_is_better=lower_is_better
+    )
     return html.Div(
         [
             html.Div(label, style={"fontSize": "13px", "color": "#93c5fd", "marginBottom": "4px"}),
             html.Div(
                 [
-                    html.Span(metric_value(metrics_cache, key, formatter), style={"marginRight": "8px"}),
-                    html.Span(
-                        metric_value(reranker_metrics_cache, key, formatter),
-                        style={"marginRight": "8px", "color": "#cbd5e1"},
-                    ),
-                    html.Span(delta_text, style={"color": delta_color, "fontSize": "14px", "fontWeight": 700}),
+                    html.Span("Baseline:", style={"marginRight": "4px", "color": "#cbd5e1"}),
+                    html.Span(metric_value(metrics_cache, key, formatter), style={"marginRight": "12px"}),
+                    html.Span("Reranker:", style={"marginRight": "4px", "color": "#cbd5e1"}),
+                    html.Span(metric_value(reranker_metrics_cache, key, formatter), style={"marginRight": "4px"}),
+                    html.Span(rerank_delta, style={"color": rerank_color, "marginRight": "12px"}),
+                    html.Span("Agentic:", style={"marginRight": "4px", "color": "#cbd5e1"}),
+                    html.Span(metric_value(agentic_metrics_cache, key, formatter), style={"marginRight": "4px"}),
+                    html.Span(agentic_delta, style={"color": agentic_color}),
                 ],
                 style={"display": "flex", "alignItems": "baseline"},
             ),

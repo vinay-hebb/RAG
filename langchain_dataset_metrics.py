@@ -1,4 +1,4 @@
-"""Quick-and-dirty retrieval check for the LangChain RAG setup."""
+"""Quick-and-dirty retrieval check for the LangChain RAG setup (baseline, reranker, and agentic)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Callable, Dict, List, Sequence
 
 import matplotlib
 
@@ -21,7 +21,8 @@ from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from langchain_rag import DEFAULT_CACHE_FOLDER, build_embeddings, build_reranker, retrieve_and_rerank
+from langchain_rag import DEFAULT_CACHE_FOLDER, build_embeddings, build_llm, build_reranker, retrieve_and_rerank
+from agentic_rag import generate_rewrites, multi_query_retrieve
 
 
 DEFAULT_TOP_K = (1, 3, 5, 10)
@@ -105,29 +106,67 @@ def save_index(store: FAISS, path: Path) -> None:
     store.save_local(str(path))
 
 
-def evaluate_retrieval(
+def _extract_doc(obj) -> Document:
+    if isinstance(obj, Document):
+        return obj
+    if hasattr(obj, "doc"):
+        return obj.doc  # RetrievedDoc from agentic_rag
+    if isinstance(obj, (list, tuple)) and obj:
+        candidate = obj[0]
+        if isinstance(candidate, Document):
+            return candidate
+    raise TypeError(f"Unsupported retrieval result type: {type(obj)}")
+
+
+def make_standard_retriever(store: FAISS, reranker, candidate_k: int) -> Callable[[str, int], Sequence[Document]]:
+    def retrieve(question: str, top_k: int) -> Sequence[Document]:
+        results = retrieve_and_rerank(
+            store,
+            question,
+            top_k=top_k,
+            reranker=reranker,
+            candidate_k=max(candidate_k, top_k),
+        )
+        return [doc for doc, _ in results]
+
+    return retrieve
+
+
+def make_agentic_retriever(
     store: FAISS,
+    llm,
+    rewrites: int,
+    reranker,
+    candidate_k: int,
+) -> Callable[[str, int], Sequence[Document]]:
+    def retrieve(question: str, top_k: int) -> Sequence[Document]:
+        queries = generate_rewrites(llm, question, rewrites)
+        results = multi_query_retrieve(
+            store,
+            queries=queries,
+            top_k=top_k,
+            candidate_k=max(candidate_k, top_k),
+            reranker=reranker,
+        )
+        return [_extract_doc(item) for item in results]
+
+    return retrieve
+
+
+def evaluate_retrieval(
     corpus: Corpus,
     top_k_values: Sequence[int],
-    reranker=None,
-    candidate_k: int = 0,
+    retrieve_fn: Callable[[str, int], Sequence[Document]],
 ) -> Dict[str, float]:
     max_k = max(top_k_values)
-    search_k = max(candidate_k, max_k)
     hits_by_k = {k: 0 for k in top_k_values}
     ndcg_by_k = {k: 0.0 for k in top_k_values}
     reciprocal_ranks: List[float] = []
     ranks: List[int] = []
 
     for example in tqdm(corpus.examples, desc="Evaluating queries"):
-        results = retrieve_and_rerank(
-            store,
-            example.question,
-            top_k=max_k,
-            reranker=reranker,
-            candidate_k=search_k,
-        )
-        doc_hits = [doc.metadata.get("doc_id") for doc, _ in results]
+        docs = retrieve_fn(example.question, max_k)
+        doc_hits = [doc.metadata.get("doc_id") for doc in docs]
         rank = None
         for i, doc_id in enumerate(doc_hits):
             if doc_id == example.doc_id:
@@ -226,6 +265,29 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="How many candidates to retrieve from the vector store before reranking",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["baseline", "reranker", "agentic"],
+        default="baseline",
+        help="Retrieval strategy to evaluate",
+    )
+    parser.add_argument("--rewrites", type=int, default=3, help="Number of rewrites to generate in agentic mode")
+    parser.add_argument("--model", type=str, default="gemma3:1b", help="Chat model for agentic mode")
+    parser.add_argument(
+        "--provider",
+        type=str,
+        choices=["openai", "ollama"],
+        default="ollama",
+        help="LLM provider for agentic mode",
+    )
+    parser.add_argument(
+        "--ollama-base-url",
+        type=str,
+        default="http://localhost:11434/v1",
+        help="Base URL for the Ollama API",
+    )
+    parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature for agentic mode")
     parser.add_argument("--metrics-json", type=str, default=None, help="Optional path to save metrics as JSON")
     parser.add_argument("--metrics-plot", type=str, default=None, help="Optional path to save hit-rate@k bar plot (PNG)")
     return parser.parse_args()
@@ -235,7 +297,9 @@ def main() -> None:
     args = parse_args()
     top_k_values = parse_top_k(args.top_k)
     cache_folder = Path(args.cache_folder)
-    reranker = build_reranker(args.reranker_model, cache_folder=cache_folder) if args.use_reranker else None
+    mode = args.mode
+    use_reranker = args.use_reranker or mode == "reranker"
+    reranker = build_reranker(args.reranker_model, cache_folder=cache_folder) if use_reranker else None
     corpus = load_corpus(
         dataset_name=args.dataset,
         split=args.split,
@@ -245,14 +309,25 @@ def main() -> None:
         chunk_overlap=args.chunk_overlap,
     )
     store = build_store(corpus, args.embedding_model, cache_folder=cache_folder)
-    candidate_k = max(args.rerank_candidates if args.use_reranker else max(top_k_values), max(top_k_values))
-    metrics = evaluate_retrieval(
-        store,
-        corpus,
-        top_k_values=top_k_values,
-        reranker=reranker,
-        candidate_k=candidate_k,
-    )
+    candidate_k = max(args.rerank_candidates if use_reranker else max(top_k_values), max(top_k_values))
+    if mode == "agentic":
+        llm = build_llm(
+            model=args.model,
+            provider=args.provider,
+            temperature=args.temperature,
+            ollama_base_url=args.ollama_base_url,
+        )
+        retrieve_fn = make_agentic_retriever(
+            store,
+            llm=llm,
+            rewrites=args.rewrites,
+            reranker=reranker,
+            candidate_k=candidate_k,
+        )
+    else:
+        retrieve_fn = make_standard_retriever(store, reranker=reranker, candidate_k=candidate_k)
+
+    metrics = evaluate_retrieval(corpus, top_k_values=top_k_values, retrieve_fn=retrieve_fn)
     print(json.dumps(metrics, indent=2))
     index_path = Path(args.index_path)
     save_index(store, index_path)

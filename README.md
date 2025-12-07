@@ -4,7 +4,7 @@ This repo illustrates how RAG can be used and how reranker improves metrics. It 
 
 ## Evaluation results
 - Current sample run (`squad` split `train[:2000]`, 800 examples, `all-MiniLM-L6-v2` embeddings):
-![LangChain dataset metrics plot](artifacts/reranker_comparison.png)
+![LangChain dataset metrics plot](comparison.png)
 
 ## Quickstart
 
@@ -35,17 +35,32 @@ Helper script that starts `ollama serve` (if needed) and runs the Ollama query:
 The CLI reads files, chunks, embeds, saves to `artifacts/langchain_index/`, retrieves, and answers with citations.
 Model downloads (embeddings/rerankers) default to `artifacts/`; override with `--cache-folder` or `CACHE_FOLDER`.
 
+### Agentic RAG on SQuAD
+- Build the SQuAD index (defaults: `squad`, split `validation[:2000]`, 1 context/question, 500-char chunks):
+```
+python agentic_rag.py ingest --index-path artifacts/squad_index --sample-size 2000 --contexts-per-question 1
+```
+- Ask with multi-query retrieval + optional reranker + reflection (uses query rewrites and cites context indices):
+```
+python agentic_rag.py ask --question "Who wrote the novel Pride and Prejudice?" --index-path artifacts/squad_index --provider ollama --model gemma3:1b --use-reranker --reflect
+```
+- One-shot runner that auto-starts Ollama, then calls the agentic pipeline (defaults shown above):
+```
+./run_agentic_squad.sh "Who wrote the novel Pride and Prejudice?"
+```
+Tune `--rewrites`, `--top-k`, or `--rerank-candidates` (or env vars like `MODEL`, `RERANK_CANDIDATES`, `REFLECT`) to adjust behavior. Set `OPENAI_MODEL`/`OPENAI_API_KEY` to use OpenAI instead of Ollama.
+
 ## Evaluate with a Hugging Face dataset (LangChain)
 - Quick retrieval check (uses `RecursiveCharacterTextSplitter`, LangChain FAISS, and your chosen embedding model):
 ```
 python langchain_dataset_metrics.py --dataset squad --split "train[:2000]" --sample-size 800 --embedding-model all-MiniLM-L6-v2 --metrics-json artifacts/lc_metrics.json --metrics-plot artifacts/lc_metrics.png
 ```
 - Flags are the usual suspects: tweak `--chunk-size`, `--chunk-overlap`, `--top-k`, and `--embedding-model`. Prints metrics; optionally writes JSON/PNG.
-- Compare baseline vs reranker (runs both in one go and writes comparison JSON for the Dash UI):
+- Compare baseline, reranker, and agentic RAG (runs all three and writes comparison JSON for the Dash UI):
 ```
-./run_reranker_comparison.sh
+./run_rag_comparison.sh
 ```
-Outputs land in `artifacts/` (`lc_metrics*.json/.png` plus `lc_metrics_reranker.json` and `lc_metrics_comparison.json`).
+Outputs land in `artifacts/` (`lc_metrics*.json/.png`, `lc_metrics_reranker.json`, and `lc_metrics_agentic.json`).
 
 ## Web app (questions + metrics)
 - Start the Dash UI (uses the LangChain FAISS index at `artifacts/langchain_index`, auto-starts `ollama serve`, and shows metrics inline if found):
