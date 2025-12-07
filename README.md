@@ -1,4 +1,4 @@
-# Illustration of Retrieval-Augmented Generation (RAG) with reranker
+# Comparison of Traditional Retrieval-Augmented Generation (RAG), reranker and Agnetic RAG
 
 This repo compares traditional RAG, traditional RAG+reranker, Agentic RAG for simple dataset to gain better insights. It can ingest some `.txt`/`.md` files, index with FAISS, and query with OpenAI or Ollama. 
 
