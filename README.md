@@ -4,10 +4,6 @@ This repo illustrates how RAG can be used and how reranker improves metrics. It 
 
 ## Evaluation results
 - Current sample run (`squad` split `train[:2000]`, 800 examples, `all-MiniLM-L6-v2` embeddings):
-  - MRR: 0.764
-  - Mean rank: 2.34
-  - Samples evaluated: 800
-- Plot from the same run (hit-rate + MRR across `k`):
 ![LangChain dataset metrics plot](artifacts/reranker_comparison.png)
 
 ## Quickstart
