@@ -1,6 +1,14 @@
-# Retrieval-Augmented Generation (RAG) Starter
+# Illustration of Retrieval-Augmented Generation (RAG) with reranker
 
-This repo keeps a small LangChain RAG loop in one place: ingest some `.txt`/`.md` files, index with FAISS, and query with OpenAI or Ollama. Nothing fancy, just the bits you need.
+This repo illustrates how RAG can be used and how reranker improves metrics. It can ingest some `.txt`/`.md` files, index with FAISS, and query with OpenAI or Ollama. 
+
+## Evaluation results
+- Current sample run (`squad` split `train[:2000]`, 800 examples, `all-MiniLM-L6-v2` embeddings):
+  - MRR: 0.764
+  - Mean rank: 2.34
+  - Samples evaluated: 800
+- Plot from the same run (hit-rate + MRR across `k`):
+![LangChain dataset metrics plot](artifacts/reranker_comparison.png)
 
 ## Quickstart
 
@@ -42,14 +50,6 @@ python langchain_dataset_metrics.py --dataset squad --split "train[:2000]" --sam
 ./run_reranker_comparison.sh
 ```
 Outputs land in `artifacts/` (`lc_metrics*.json/.png` plus `lc_metrics_reranker.json` and `lc_metrics_comparison.json`).
-
-## Evaluation results
-- Current sample run (`squad` split `train[:2000]`, 800 examples, `all-MiniLM-L6-v2` embeddings):
-  - MRR: 0.764
-  - Mean rank: 2.34
-  - Samples evaluated: 800
-- Plot from the same run (hit-rate + MRR across `k`):
-![LangChain dataset metrics plot](artifacts/lc_metrics.png)
 
 ## Web app (questions + metrics)
 - Start the Dash UI (uses the LangChain FAISS index at `artifacts/langchain_index`, auto-starts `ollama serve`, and shows metrics inline if found):
