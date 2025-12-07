@@ -4,7 +4,7 @@ This repo illustrates how RAG can be used and how reranker improves metrics. It 
 
 ## Evaluation results
 - Current sample run (`squad` split `train[:2000]`, 800 examples, `all-MiniLM-L6-v2` embeddings):
-![LangChain dataset metrics plot](comparison.png)
+![LangChain dataset metrics plot](artifacts/comparison.png)
 
 ## Quickstart
 
