@@ -1,6 +1,6 @@
 # Illustration of Retrieval-Augmented Generation (RAG) with reranker
 
-This repo illustrates how RAG can be used and how reranker improves metrics. It can ingest some `.txt`/`.md` files, index with FAISS, and query with OpenAI or Ollama. 
+This repo compares traditional RAG, traditional RAG+reranker, Agentic RAG for simple dataset to gain better insights. It can ingest some `.txt`/`.md` files, index with FAISS, and query with OpenAI or Ollama. 
 
 ## Evaluation results
 - Current sample run (`squad` split `train[:2000]`, 800 examples, `all-MiniLM-L6-v2` embeddings):
