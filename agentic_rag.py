@@ -1,22 +1,15 @@
 """Agentic RAG flow tuned for SQuAD with multi-query retrieval and reflection."""
 
 from __future__ import annotations
-
 import argparse
 import logging
 import os
-import random
-import shutil
-import subprocess
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import List, Sequence
+import asyncio
 
-from datasets import load_dataset
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
 
 from langchain_rag import (
     DEFAULT_CACHE_FOLDER,
@@ -26,104 +19,267 @@ from langchain_rag import (
     build_llm,
     build_reranker,
     retrieve_and_rerank,
+    rerank_results,
     split_documents,
+
+    # Moved from agentic_rag.py
+    DEFAULT_DATASET,
+    DEFAULT_SUBSET,
+    DEFAULT_SPLIT,
+    DEFAULT_CONTEXTS_PER_QUESTION,
+    LOCAL_OLLAMA_URLS,
+    RetrievedDoc,
+    load_squad_contexts,
+    generate_rewrites,
+    multi_query_retrieve,
+    ensure_ollama_model_available,
+    format_context,
+    synthesize_answer,
+    reflect_answer,
 )
+
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-DEFAULT_DATASET = "squad"
-DEFAULT_SUBSET: str | None = None
-DEFAULT_SPLIT = "validation[:2000]"
 DEFAULT_INDEX_PATH = Path("artifacts/squad_index")
 DEFAULT_TOP_K = 6
 DEFAULT_REWRITES = 3
-DEFAULT_CONTEXTS_PER_QUESTION = 1
-LOCAL_OLLAMA_URLS = {
-    "http://localhost:11434",
-    "http://localhost:11434/v1",
-    "http://127.0.0.1:11434",
-    "http://127.0.0.1:11434/v1",
-}
+
+from typing import List, TypedDict, Union, Literal, Optional # Added for LangGraphState
+from langchain_core.language_models.chat_models import BaseChatModel # Added for LangGraphState
+from langchain_core.runnables import RunnableConfig # Added for LangGraphState
+from langgraph.graph import StateGraph, START # Added for LangGraph
+
+# --- Start LangGraph integration ---
+
+# Define the Graph State
+class GraphState(TypedDict):
+    """
+    Represents the state of our graph.
+    Attributes:
+        questions: The user's initial questions (List of strings).
+        rewritten_queries: List of lists of rewritten queries for retrieval (one list per question).
+        documents: List of lists of retrieved documents (one list of RetrievedDoc objects per question).
+        draft_answers: The initial draft answers from synthesis (List of strings).
+        final_answers: The final answers after reflection (if enabled) (List of strings).
+        llm: The LLM instance used for generations.
+        store: The FAISS vector store.
+        reranker: The CrossEncoder reranker instance (optional).
+        config: Configuration for the run (e.g., top_k, rerank_candidates).
+    """
+    questions: List[str]
+    rewritten_queries: List[List[str]]
+    documents: List[List[RetrievedDoc]]
+    draft_answers: List[str]
+    final_answers: List[str]
+    llm: BaseChatModel
+    store: FAISS
+    reranker: Optional[object] # CrossEncoder type
+    config: dict # To pass args like top_k, rerank_candidates, use_reranker, reflect
 
 
-@dataclass(frozen=True)
-class RetrievedDoc:
-    doc: Document
-    score: float
-    query: str
+# Node Functions
+async def rewrite_node(state: GraphState) -> dict:
+    """Rewrites each question to broaden retrieval coverage."""
+    logger.info("---REWRITE QUESTIONS---")
+    questions = state["questions"]
+    llm = state["llm"]
+    config = state["config"]
+    rewrite_count = config.get("rewrites", 3)
+
+    all_rewritten_queries = []
+    for question in questions:
+        rewrites = await generate_rewrites(llm, question, rewrite_count)
+        all_rewritten_queries.append(rewrites)
+        logger.info("Rewritten queries for '%s': %s", question, rewrites)
+    return {"rewritten_queries": all_rewritten_queries}
 
 
-def _clean_line(line: str) -> str:
-    stripped = line.strip()
-    while stripped and stripped[0] in "-•0123456789. ":
-        stripped = stripped[1:].strip()
-    return stripped
+async def retrieve_node(state: GraphState) -> dict:
+    """Performs multi-query retrieval and reranking for each question."""
+    logger.info("---RETRIEVE DOCUMENTS FOR ALL QUESTIONS---")
+    questions = state["questions"]
+    all_rewritten_queries = state["rewritten_queries"]
+    store = state["store"]
+    reranker = state["reranker"]
+    config = state["config"]
+    top_k = config.get("top_k", 6)
+    rerank_candidates = config.get("rerank_candidates", 18)
+    sequential_retrieval = config.get("sequential_retrieval", False)
+
+    all_retrieved_documents = []
+    # Use asyncio.gather to run retrieval for all questions in parallel
+    retrieval_tasks = []
+    for i, question in enumerate(questions):
+        rewritten_queries = all_rewritten_queries[i]
+        retrieval_tasks.append(
+            multi_query_retrieve(
+                store,
+                queries=rewritten_queries,
+                base_question=question,
+                top_k=top_k,
+                candidate_k=rerank_candidates,
+                reranker=reranker,
+                run_sequentially=sequential_retrieval,
+            )
+        )
+    
+    all_retrieved_documents = await asyncio.gather(*retrieval_tasks)
+
+    for i, docs_for_q in enumerate(all_retrieved_documents):
+        logger.info("Retrieved %d documents for question '%s'.", len(docs_for_q), questions[i])
+    
+    return {"documents": all_retrieved_documents}
 
 
-def _add_doc(
-    docs: List[Document],
-    text: str,
-    source: str,
-    kind: str,
-    question_id: str,
-) -> None:
-    content = text.strip()
-    if not content:
-        return
-    doc_id = f"{kind}:{source}:{abs(hash(content)) % 1_000_000_000}"
-    metadata = {"source": source, "kind": kind, "doc_id": doc_id}
-    if question_id:
-        metadata["question_id"] = question_id
-    docs.append(Document(page_content=content, metadata=metadata))
+async def generate_node(state: GraphState) -> dict:
+    """Synthesizes draft answers from retrieved context for each question."""
+    logger.info("---GENERATE DRAFT ANSWERS---")
+    questions = state["questions"]
+    all_documents = state["documents"]
+    llm = state["llm"]
+
+    draft_answers = []
+    # Use asyncio.gather to run generation for all questions in parallel
+    generation_tasks = []
+    for i, question in enumerate(questions):
+        documents_for_question = all_documents[i]
+        context_text = format_context(documents_for_question)
+        generation_tasks.append(synthesize_answer(llm, question, context_text))
+    
+    draft_answers = await asyncio.gather(*generation_tasks)
+
+    for i, draft in enumerate(draft_answers):
+        logger.info("Generated draft answer for question '%s'.", questions[i])
+    
+    return {"draft_answers": draft_answers}
 
 
-def extract_squad_docs(example: Dict[str, object]) -> List[Document]:
-    docs: List[Document] = []
-    question_id = str(example.get("id") or "")
-    title = str(example.get("title") or "context")
-    context = str(example.get("context") or "")
-    _add_doc(docs, context, title, "context", question_id)
-    return docs
+async def reflect_node(state: GraphState) -> dict:
+    """Reflects on the draft answers and refines them for each question."""
+    logger.info("---REFLECT ON ANSWERS---")
+    questions = state["questions"]
+    draft_answers = state["draft_answers"]
+    all_documents = state["documents"]
+    llm = state["llm"]
+
+    final_answers = []
+    # Use asyncio.gather to run reflection for all questions in parallel
+    reflection_tasks = []
+    for i, question in enumerate(questions):
+        draft = draft_answers[i]
+        documents_for_question = all_documents[i]
+        context_text = format_context(documents_for_question)
+        reflection_tasks.append(reflect_answer(llm, question, draft, context_text))
+    
+    final_answers = await asyncio.gather(*reflection_tasks)
+
+    for i, final in enumerate(final_answers):
+        logger.info("Refined answer through reflection for question '%s'.", questions[i])
+    
+    return {"final_answers": final_answers}
+
+def should_reflect(state: GraphState) -> Literal["reflect", "__end__"]:
+    """Determines whether to proceed to reflection or end."""
+    config = state["config"]
+    if config.get("reflect"):
+        return "reflect"
+    return "__end__"
 
 
-def load_squad_contexts(
-    dataset: str,
-    subset: str | None,
-    split: str,
-    sample_size: int,
-    seed: int,
-    contexts_per_question: int,
-) -> List[Document]:
-    if subset:
-        dataset_split = load_dataset(dataset, subset, split=split)
-    else:
-        dataset_split = load_dataset(dataset, split=split)
-    dataset_split = dataset_split.shuffle(seed=seed)
-    if sample_size > 0:
-        sample_size = min(sample_size, len(dataset_split))
-        dataset_split = dataset_split.select(range(sample_size))
+# Build the LangGraph
+def build_agent_graph():
+    workflow = StateGraph(GraphState)
 
-    all_docs: List[Document] = []
-    seen_texts: set[str] = set()
+    # Add nodes
+    workflow.add_node("rewrite", rewrite_node)
+    workflow.add_node("retrieve", retrieve_node)
+    workflow.add_node("generate", generate_node)
+    workflow.add_node("reflect", reflect_node)
 
-    for example in dataset_split:
-        docs = extract_squad_docs(example)
-        random.shuffle(docs)
-        if contexts_per_question > 0:
-            docs = docs[:contexts_per_question]
+    # Set up edges
+    workflow.add_edge(START, "rewrite")
+    workflow.add_edge("rewrite", "retrieve")
+    workflow.add_edge("retrieve", "generate")
 
-        for doc in docs:
-            content = doc.page_content.strip()
-            if not content or content in seen_texts:
-                continue
-            seen_texts.add(content)
-            all_docs.append(doc)
+    # Conditional edge for reflection
+    workflow.add_conditional_edges(
+        "generate",
+        should_reflect,
+        {"reflect": "reflect", "__end__": "__end__"},
+    )
+    workflow.add_edge("reflect", "__end__") # Reflection is the last step if taken
 
-    if not all_docs:
-        raise ValueError("No contexts extracted from the SQuAD split.")
-    logger.info("Loaded %d unique context documents from SQuAD.", len(all_docs))
-    return all_docs
+    return workflow.compile()
+
+async def run_langgraph_agent(
+    questions: List[str],
+    llm: BaseChatModel,
+    store: FAISS,
+    reranker: Optional[object],
+    config: dict,
+) -> List[dict]:
+    """
+    Runs the agentic RAG flow using LangGraph for a batch of questions.
+    Accepts pre-initialized components.
+    Returns a list of dictionaries, one for each question's final state.
+    """
+    # Prepare initial state and config
+    initial_state = GraphState(
+        questions=questions, # Now a list of questions
+        rewritten_queries=[[] for _ in questions], # Initialize list of lists
+        documents=[[] for _ in questions],         # Initialize list of lists
+        draft_answers=["" for _ in questions],      # Initialize list of strings
+        final_answers=["" for _ in questions],      # Initialize list of strings
+        llm=llm,
+        store=store,
+        reranker=reranker,
+        config=config,
+    )
+
+    app = build_agent_graph()
+    final_state = await app.ainvoke(initial_state)
+
+    results_for_all_questions = []
+    for i, question in enumerate(final_state["questions"]):
+        print(f"\n--- LangGraph Agent Results for Question {i+1} ---")
+        print("\nInitial Question:")
+        print(question)
+        print("\nRewritten Queries:")
+        for q in final_state["rewritten_queries"][i]:
+            print(f"- {q}")
+
+        print("\nRetrieved Context:")
+        if final_state["documents"] and len(final_state["documents"]) > i:
+            for idx, item in enumerate(final_state["documents"][i]):
+                source = item.doc.metadata.get("source", "unknown")
+                print(f"[{idx}] score={item.score:.3f} source={source} via='{item.query}'")
+                print(item.doc.page_content[:500].strip())
+                print("---")
+        else:
+            print("No documents retrieved.")
+
+        print("\nDraft Answer:")
+        print(final_state["draft_answers"][i])
+
+        if final_state["config"].get("reflect"):
+            print("\nFinal Answer (after reflection):")
+            print(final_state["final_answers"][i])
+        else:
+            print("\nReflection was not enabled.")
+        
+        results_for_all_questions.append({
+            "question": question,
+            "rewritten_queries": final_state["rewritten_queries"][i],
+            "documents": final_state["documents"][i],
+            "draft_answer": final_state["draft_answers"][i],
+            "final_answer": final_state["final_answers"][i] if final_state["config"].get("reflect") else final_state["draft_answers"][i],
+        })
+    
+    return results_for_all_questions
+
+# --- End LangGraph integration ---
 
 
 def build_index(args: argparse.Namespace) -> None:
@@ -146,191 +302,6 @@ def build_index(args: argparse.Namespace) -> None:
         len(chunks),
         index_path,
     )
-
-
-def generate_rewrites(llm, question: str, rewrite_count: int) -> List[str]:
-    if rewrite_count <= 0:
-        return [question]
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                (
-                    "You rewrite questions to broaden retrieval coverage. "
-                    "Return distinct, concise rewrites that emphasize different key entities or facts. "
-                    "Avoid numbering or quotes."
-                ),
-            ),
-            ("user", "Original question: {question}\nNumber of rewrites: {count}"),
-        ]
-    )
-    parser = StrOutputParser()
-    chain = prompt | llm | parser
-    raw = chain.invoke({"question": question, "count": rewrite_count})
-    rewrites: List[str] = [question]
-    seen_lower = {question.lower()}
-    for line in raw.splitlines():
-        candidate = _clean_line(line)
-        if not candidate:
-            continue
-        lowered = candidate.lower()
-        if lowered in seen_lower:
-            continue
-        rewrites.append(candidate)
-        seen_lower.add(lowered)
-        if len(rewrites) >= rewrite_count + 1:
-            break
-    return rewrites
-
-
-def multi_query_retrieve(
-    store: FAISS,
-    queries: Sequence[str],
-    top_k: int,
-    candidate_k: int,
-    reranker=None,
-) -> List[RetrievedDoc]:
-    collected: Dict[str, RetrievedDoc] = {}
-    search_k = max(top_k, candidate_k)
-    for query in queries:
-        results = retrieve_and_rerank(
-            store,
-            query,
-            top_k=top_k,
-            reranker=reranker,
-            candidate_k=search_k,
-        )
-        for doc, score in results:
-            key = doc.page_content
-            existing = collected.get(key)
-            if existing is None or score > existing.score:
-                collected[key] = RetrievedDoc(doc=doc, score=score, query=query)
-    ranked = sorted(collected.values(), key=lambda item: item.score, reverse=True)
-    return ranked[:top_k]
-
-
-def ensure_ollama_model_available(model: str, base_url: str) -> None:
-    """Fail fast with a clear error if the Ollama model is missing locally."""
-    normalized_url = base_url.rstrip("/")
-    if normalized_url not in LOCAL_OLLAMA_URLS:
-        return
-    if shutil.which("ollama") is None:
-        logger.warning("Ollama provider selected but 'ollama' CLI not found; skipping local model check.")
-        return
-    result = subprocess.run(
-        ["ollama", "show", model],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Ollama model '{model}' not found. Pull it with `ollama pull {model}` "
-            f"or choose a different --model/--provider. Base URL: {base_url}"
-        )
-
-
-def format_context(docs: Sequence[RetrievedDoc]) -> str:
-    if not docs:
-        return "No supporting context retrieved."
-    formatted: List[str] = []
-    for idx, item in enumerate(docs):
-        source = item.doc.metadata.get("source", "unknown")
-        formatted.append(
-            f"[{idx}] (via '{item.query}' | source={source} | score={item.score:.3f})\n{item.doc.page_content}"
-        )
-    return "\n\n".join(formatted)
-
-
-def synthesize_answer(llm, question: str, context: str) -> str:
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                (
-                    "Answer with the given context. Keep it concise. "
-                    "Cite supporting snippets with bracketed indices like [0]. "
-                    "If the context does not support an answer, say you do not know."
-                ),
-            ),
-            ("user", "Context:\n{context}\n\nQuestion: {question}\nAnswer:"),
-        ]
-    )
-    parser = StrOutputParser()
-    chain = prompt | llm | parser
-    return chain.invoke({"context": context, "question": question})
-
-
-def reflect_answer(llm, question: str, draft: str, context: str) -> str:
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                (
-                    "You double-check answers against evidence. "
-                    "If the draft lacks support, rewrite a short, supported answer with citations or say you do not know."
-                ),
-            ),
-            (
-                "user",
-                "Question: {question}\nDraft answer: {draft}\nContext:\n{context}\n\nImproved answer:",
-            ),
-        ]
-    )
-    parser = StrOutputParser()
-    chain = prompt | llm | parser
-    return chain.invoke({"question": question, "draft": draft, "context": context})
-
-
-def run_agent(args: argparse.Namespace) -> None:
-    embeddings = build_embeddings(args.embedding_model, cache_folder=Path(args.cache_folder))
-    store = FAISS.load_local(
-        str(Path(args.index_path)),
-        embeddings,
-        allow_dangerous_deserialization=True,
-    )
-    resolved_provider = args.provider or _infer_provider(args.model)
-    if resolved_provider == "ollama":
-        try:
-            ensure_ollama_model_available(args.model, args.ollama_base_url)
-        except RuntimeError as exc:
-            logger.error("%s", exc)
-            raise SystemExit(1) from exc
-    llm = build_llm(
-        model=args.model,
-        provider=resolved_provider,
-        temperature=args.temperature,
-        ollama_base_url=args.ollama_base_url,
-    )
-    reranker = build_reranker(args.reranker_model, cache_folder=Path(args.cache_folder)) if args.use_reranker else None
-    rewrites = generate_rewrites(llm, args.question, args.rewrites)
-    logger.info("Query rewrites: %s", rewrites)
-
-    results = multi_query_retrieve(
-        store,
-        queries=rewrites,
-        top_k=args.top_k,
-        candidate_k=args.rerank_candidates,
-        reranker=reranker,
-    )
-
-    print("\nRetrieved context:")
-    for idx, item in enumerate(results):
-        source = item.doc.metadata.get("source", "unknown")
-        print(f"[{idx}] score={item.score:.3f} source={source} via='{item.query}'")
-        print(item.doc.page_content[:500].strip())
-        print("---")
-
-    context_text = format_context(results)
-    draft = synthesize_answer(llm, args.question, context_text)
-    final = reflect_answer(llm, args.question, draft, context_text) if args.reflect else draft
-
-    print("\nDraft answer:\n")
-    print(draft)
-    if args.reflect:
-        print("\nRefined answer:\n")
-        print(final)
 
 
 def parse_args() -> argparse.Namespace:
@@ -373,7 +344,7 @@ def parse_args() -> argparse.Namespace:
 
     ask = subparsers.add_parser("ask", help="Run the agentic RAG flow over a built index.")
     ask.add_argument("--index-path", type=str, default=str(DEFAULT_INDEX_PATH), help="Folder containing index files")
-    ask.add_argument("--question", type=str, required=True, help="User question to answer")
+    ask.add_argument("--questions", type=str, nargs='+', required=True, help="User questions to answer (space-separated)")
     ask.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help="How many chunks to keep after merging rewrites")
     ask.add_argument("--rewrites", type=int, default=DEFAULT_REWRITES, help="How many rewrites to request")
     ask.add_argument("--rerank-candidates", type=int, default=18, help="How many candidates to pull before reranking")
@@ -391,23 +362,16 @@ def parse_args() -> argparse.Namespace:
     ask.add_argument(
         "--model",
         type=str,
-        default=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        help="Chat model name (OpenAI or Ollama)",
+        default=os.getenv("OLLAMA_MODEL", "gemma:2b"),
+        help="Chat model name (Ollama or OpenAI)",
     )
     ask.add_argument(
         "--provider",
         type=str,
         choices=["openai", "ollama"],
-        default=None,
+        default="ollama",
         help="LLM provider (defaults to auto-detect from model name)",
     )
-    ask.add_argument(
-        "--ollama-base-url",
-        type=str,
-        default=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-        help="Base URL for the Ollama API",
-    )
-    ask.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature for the chat model")
     ask.add_argument(
         "--embedding-model",
         type=str,
@@ -425,15 +389,58 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run a second-pass reflection step to verify the draft answer",
     )
-    ask.set_defaults(func=run_agent)
+    ask.add_argument(
+        "--sequential-retrieval",
+        action="store_true",
+        help="Force multi-query retrieval to run sequentially instead of in parallel",
+    )
+    ask.set_defaults(func=run_langgraph_agent)
 
     return parser.parse_args()
 
 
-def main() -> None:
+async def main() -> None:
     args = parse_args()
-    args.func(args)
+    if args.command == "ingest":
+        args.func(args)
+    elif args.command == "ask":
+        embeddings = build_embeddings(args.embedding_model, cache_folder=Path(args.cache_folder))
+        store = FAISS.load_local(
+            str(Path(args.index_path)),
+            embeddings,
+            allow_dangerous_deserialization=True,
+        )
+        resolved_provider = args.provider or _infer_provider(args.model)
+        if resolved_provider == "ollama":
+            try:
+                ensure_ollama_model_available(args.model, args.ollama_base_url)
+            except RuntimeError as exc:
+                logger.error("%s", exc)
+                raise SystemExit(1) from exc
+        llm = build_llm(
+            model=args.model,
+            provider=resolved_provider,
+            temperature=args.temperature,
+            ollama_base_url=args.ollama_base_url,
+        )
+        reranker = build_reranker(args.reranker_model, cache_folder=Path(args.cache_folder)) if args.use_reranker else None
+
+        config = {
+            "top_k": args.top_k,
+            "rewrites": args.rewrites,
+            "rerank_candidates": args.rerank_candidates,
+            "use_reranker": args.use_reranker,
+            "reflect": args.reflect,
+            "sequential_retrieval": args.sequential_retrieval,
+        }
+        await run_langgraph_agent(
+            questions=args.questions,
+            llm=llm,
+            store=store,
+            reranker=reranker,
+            config=config,
+        )
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

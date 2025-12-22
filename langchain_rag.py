@@ -1,11 +1,17 @@
-"""Tiny LangChain RAG CLI that keeps things simple (FAISS + OpenAI/Ollama)."""
+"Tiny LangChain RAG CLI that keeps things simple (FAISS + OpenAI/Ollama)."
 
 from __future__ import annotations
 
 import argparse
 import os
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Dict
+from dataclasses import dataclass
+from datasets import load_dataset
+import shutil
+import subprocess
+import random
+import asyncio
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -21,7 +27,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from sentence_transformers import CrossEncoder
 
 
-SUPPORTED_EXTENSIONS = {".txt", ".md"}
+SUPPORTED_EXTENSIONS = {'.txt', '.md'}
 DEFAULT_RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_CACHE_FOLDER = Path(os.getenv("CACHE_FOLDER", "artifacts"))
 
@@ -51,7 +57,6 @@ def _infer_provider(name: str) -> str:
         return "ollama"
     return "openai"
 
-
 def build_embeddings(model_name: str, cache_folder: Path | str = DEFAULT_CACHE_FOLDER) -> Embeddings:
     cache_path = Path(cache_folder)
     cache_path.mkdir(parents=True, exist_ok=True)
@@ -60,13 +65,11 @@ def build_embeddings(model_name: str, cache_folder: Path | str = DEFAULT_CACHE_F
         return OpenAIEmbeddings(model=normalized)
     return HuggingFaceEmbeddings(model_name=model_name, cache_folder=str(cache_path))
 
-
 def build_reranker(model_name: str = DEFAULT_RERANKER_MODEL, cache_folder: Path | str = DEFAULT_CACHE_FOLDER) -> CrossEncoder:
     """Construct a cross-encoder reranker model."""
     cache_path = Path(cache_folder)
     cache_path.mkdir(parents=True, exist_ok=True)
     return CrossEncoder(model_name, cache_folder=str(cache_path))
-
 
 def load_documents(data_dir: Path) -> List[Document]:
     docs: List[Document] = []
@@ -80,7 +83,6 @@ def load_documents(data_dir: Path) -> List[Document]:
         raise FileNotFoundError(f"No text/markdown files found under {data_dir}")
     return docs
 
-
 def split_documents(documents: Sequence[Document], chunk_size: int, chunk_overlap: int) -> List[Document]:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
@@ -88,7 +90,6 @@ def split_documents(documents: Sequence[Document], chunk_size: int, chunk_overla
         separators=["\n\n", "\n", ". ", " "],
     )
     return splitter.split_documents(documents)
-
 
 def ingest_corpus(
     data_dir: Path,
@@ -107,12 +108,12 @@ def ingest_corpus(
     print(f"Ingested {len(documents)} documents into {len(chunks)} chunks.")
     print(f"Saved FAISS index to {index_path}")
 
-
 def build_llm(
     model: str,
-    provider: Optional[str],
-    temperature: float,
-    ollama_base_url: str,
+    provider: Optional[str] = "ollama",
+    temperature: float = 0.2, # Also setting a default temperature as it's often used with Ollama
+    ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"), # Setting a default ollama base url
+    sequential_retrieval: bool = False, # New parameter for controlling multi_query_retrieve
 ) -> BaseChatModel:
     resolved = provider or _infer_provider(model)
     if resolved == "ollama":
@@ -120,7 +121,6 @@ def build_llm(
         return ChatOllama(model=normalized, base_url=ollama_base_url, temperature=temperature)
     normalized = _normalize_openai_name(model)
     return ChatOpenAI(model=normalized, temperature=temperature)
-
 
 def _format_docs(docs: Sequence[Document]) -> str:
     if not docs:
@@ -130,7 +130,6 @@ def _format_docs(docs: Sequence[Document]) -> str:
         source = doc.metadata.get("source", "unknown")
         formatted.append(f"[{idx}] {doc.page_content}\nSource: {source}")
     return "\n\n".join(formatted)
-
 
 def rerank_results(
     question: str,
@@ -151,8 +150,7 @@ def rerank_results(
     combined.sort(key=lambda pair: pair[1], reverse=True)
     return combined[:top_k]
 
-
-def retrieve_and_rerank(
+async def retrieve_and_rerank(
     store: FAISS,
     question: str,
     top_k: int,
@@ -160,9 +158,8 @@ def retrieve_and_rerank(
     candidate_k: Optional[int] = None,
 ) -> List[Tuple[Document, float]]:
     search_k = max(candidate_k or top_k, top_k)
-    docs_with_scores = store.similarity_search_with_score(question, k=search_k)
+    docs_with_scores = await store.asimilarity_search_with_score(question, k=search_k)
     return rerank_results(question, docs_with_scores, reranker, top_k)
-
 
 def build_chain(
     store: FAISS,
@@ -197,7 +194,6 @@ def build_chain(
         | StrOutputParser()
     )
 
-
 def run_ingest(args: argparse.Namespace) -> None:
     ingest_corpus(
         data_dir=Path(args.data_dir),
@@ -208,8 +204,7 @@ def run_ingest(args: argparse.Namespace) -> None:
         cache_folder=Path(args.cache_folder),
     )
 
-
-def run_query(args: argparse.Namespace) -> None:
+async def run_query(args: argparse.Namespace) -> None:
     embeddings = build_embeddings(args.embedding_model, cache_folder=Path(args.cache_folder))
     store = FAISS.load_local(
         str(Path(args.index_path)),
@@ -239,11 +234,10 @@ def run_query(args: argparse.Namespace) -> None:
         temperature=args.temperature,
         ollama_base_url=args.ollama_base_url,
     )
-    chain = build_chain(store, llm, args.top_k, reranker=reranker, candidate_k=search_k)
-    answer = chain.invoke(args.question)
+    chain = await build_chain(store, llm, args.top_k, reranker=reranker, candidate_k=search_k)
+    answer = await chain.ainvoke(args.question)
     print("\nAnswer:\n")
     print(answer)
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LangChain RAG workflow using FAISS.")
@@ -315,11 +309,249 @@ def parse_args() -> argparse.Namespace:
 
     return parser.parse_args()
 
-
-def main() -> None:
+async def main() -> None:
     args = parse_args()
-    args.func(args)
+    await args.func(args)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+# Constants moved from agentic_rag.py
+DEFAULT_DATASET = "squad"
+DEFAULT_SUBSET: str | None = None
+DEFAULT_SPLIT = "validation[:2000]"
+DEFAULT_CONTEXTS_PER_QUESTION = 1
+LOCAL_OLLAMA_URLS = {
+    "http://localhost:11434",
+    "http://localhost:11434/v1",
+    "http://127.0.0.1:11434",
+    "http://127.0.0.1:11434/v1",
+}
+
+
+@dataclass(frozen=True)
+class RetrievedDoc:
+    doc: Document
+    score: float
+    query: str
+
+
+def _clean_line(line: str) -> str:
+    stripped = line.strip()
+    while stripped and stripped[0] in "-•0123456789. ":
+        stripped = stripped[1:].strip()
+    return stripped
+
+
+def _add_doc(
+    docs: List[Document],
+    text: str,
+    source: str,
+    kind: str,
+    question_id: str,
+) -> None:
+    content = text.strip()
+    if not content:
+        return
+    doc_id = f"{kind}:{source}:{abs(hash(content)) % 1_000_000_000}"
+    metadata = {"source": source, "kind": kind, "doc_id": doc_id}
+    if question_id:
+        metadata["question_id"] = question_id
+    docs.append(Document(page_content=content, metadata=metadata))
+
+def extract_squad_docs(example: Dict[str, object]) -> List[Document]:
+    docs: List[Document] = []
+    question_id = str(example.get("id") or "")
+    title = str(example.get("title") or "context")
+    context = str(example.get("context") or "")
+    _add_doc(docs, context, title, "context", question_id)
+    return docs
+
+def load_squad_contexts(
+    dataset: str,
+    subset: str | None,
+    split: str,
+    sample_size: int,
+    seed: int,
+    contexts_per_question: int,
+) -> List[Document]:
+    if subset:
+        dataset_split = load_dataset(dataset, subset, split=split)
+    else:
+        dataset_split = load_dataset(dataset, split=split)
+    dataset_split = dataset_split.shuffle(seed=seed)
+    if sample_size > 0:
+        sample_size = min(sample_size, len(dataset_split))
+        dataset_split = dataset_split.select(range(sample_size))
+
+    all_docs: List[Document] = []
+    seen_texts: set[str] = set()
+
+    for example in dataset_split:
+        docs = extract_squad_docs(example)
+        random.shuffle(docs)
+        if contexts_per_question > 0:
+            docs = docs[:contexts_per_question]
+
+        for doc in docs:
+            content = doc.page_content.strip()
+            if not content or content in seen_texts:
+                continue
+            seen_texts.add(content)
+            all_docs.append(doc)
+
+    if not all_docs:
+        raise ValueError("No contexts extracted from the SQuAD split.")
+    # logger.info("Loaded %d unique context documents from SQuAD.", len(all_docs)) # logger is not defined here
+    return all_docs
+
+async def generate_rewrites(llm, question: str, rewrite_count: int) -> List[str]:
+    if rewrite_count <= 0:
+        return [question]
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                (
+                    "You rewrite questions to broaden retrieval coverage. "
+                    "Return distinct, concise rewrites that emphasize different key entities or facts. "
+                    "Avoid numbering or quotes."
+                ),
+            ),
+            ("user", "Original question: {question}\nNumber of rewrites: {count}"),
+        ]
+    )
+    parser = StrOutputParser()
+    chain = prompt | llm | parser
+    raw = await chain.ainvoke({"question": question, "count": rewrite_count})
+    rewrites: List[str] = [question]
+    seen_lower = {question.lower()}
+    for line in raw.splitlines():
+        candidate = _clean_line(line)
+        if not candidate:
+            continue
+        lowered = candidate.lower()
+        if lowered in seen_lower:
+            continue
+        rewrites.append(candidate)
+        seen_lower.add(lowered)
+        if len(rewrites) >= rewrite_count + 1:
+            break
+    return rewrites
+
+async def multi_query_retrieve(
+    store: FAISS,
+    queries: Sequence[str],
+    base_question: str | None,
+    top_k: int,
+    candidate_k: int,
+    reranker=None,
+    run_sequentially: bool = False, # Added parameter
+) -> List[RetrievedDoc]:
+    collected: Dict[str, RetrievedDoc] = {}
+    search_k = max(top_k, candidate_k)
+
+    # Collect all retrieval tasks
+    retrieval_tasks = [
+        retrieve_and_rerank(store, query, top_k=top_k, reranker=reranker, candidate_k=search_k)
+        for query in queries
+    ]
+
+    all_results = []
+    if run_sequentially:
+        for task in retrieval_tasks:
+            all_results.append(await task)
+    else:
+        all_results = await asyncio.gather(*retrieval_tasks)
+
+    for query_results, query in zip(all_results, queries):
+        for doc, score in query_results:
+            key = doc.page_content
+            existing = collected.get(key)
+            if existing is None or score > existing.score:
+                collected[key] = RetrievedDoc(doc=doc, score=score, query=query)
+    ranked = sorted(collected.values(), key=lambda item: item.score, reverse=True)
+    if reranker is not None and base_question:
+        reranked_pairs = rerank_results(
+            base_question,
+            [(item.doc, item.score) for item in ranked],
+            reranker,
+            top_k=len(ranked),
+        )
+        reranked_docs: List[RetrievedDoc] = []
+        for doc, score in reranked_pairs:
+            key = doc.page_content
+            source = collected.get(key)
+            reranked_docs.append(RetrievedDoc(doc=doc, score=score, query=source.query if source else base_question))
+        ranked = reranked_docs
+    return ranked[:top_k]
+
+def ensure_ollama_model_available(model: str, base_url: str) -> None:
+    """Fail fast with a clear error if the Ollama model is missing locally."""
+    normalized_url = base_url.rstrip("/")
+    if normalized_url not in LOCAL_OLLAMA_URLS:
+        return
+    if shutil.which("ollama") is None:
+        # logger.warning("Ollama provider selected but 'ollama' CLI not found; skipping local model check.") # logger not defined
+        return
+    result = subprocess.run(
+        ["ollama", "show", model],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Ollama model '{model}' not found. Pull it with `ollama pull {model}` "
+            f"or choose a different --model/--provider. Base URL: {base_url}"
+        )
+
+def format_context(docs: Sequence[RetrievedDoc]) -> str:
+    if not docs:
+        return "No supporting context retrieved."
+    formatted: List[str] = []
+    for idx, item in enumerate(docs):
+        source = item.doc.metadata.get("source", "unknown")
+        formatted.append(
+            f"[{idx}] (via '{item.query}' | source={source} | score={item.score:.3f})\n{item.doc.page_content}"
+        )
+    return "\n\n".join(formatted)
+
+async def synthesize_answer(llm, question: str, context: str) -> str:
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                (
+                    "Answer with the given context. Keep it concise. "
+                    "Cite supporting snippets with bracketed indices like [0]. "
+                    "If the context does not support an answer, say you do not know."
+                ),
+            ),
+            ("user", "Context:\n{context}\n\nQuestion: {question}\nAnswer:"),
+        ]
+    )
+    parser = StrOutputParser()
+    chain = prompt | llm | parser
+    return await chain.ainvoke({"context": context, "question": question})
+
+async def reflect_answer(llm, question: str, draft: str, context: str) -> str:
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                (
+                    "You double-check answers against evidence. "
+                    "If the draft lacks support, rewrite a short, supported answer with citations or say you do not know."
+                ),
+            ),
+            (
+                "user",
+                "Question: {question}\nDraft answer: {draft}\nContext:\n{context}\n\nImproved answer:",
+            ),
+        ]
+    )
+    parser = StrOutputParser()
+    chain = prompt | llm | parser
+    return await chain.ainvoke({"question": question, "draft": draft, "context": context})

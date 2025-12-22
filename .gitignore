@@ -32,3 +32,7 @@ artifacts/langchain_index
 artifacts/.locks/
 artifacts/models--cross-encoder--ms-marco-MiniLM-L-6-v2/
 artifacts/models--sentence-transformers--all-MiniLM-L6-v2/
+_site/
+*.faiss
+run_train_pt.sh
+train_pt.py
